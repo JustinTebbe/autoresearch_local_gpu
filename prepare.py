@@ -15,6 +15,8 @@ import time
 import math
 import argparse
 import pickle
+import platform
+import multiprocessing
 from multiprocessing import Pool
 
 import requests
@@ -27,22 +29,80 @@ import torch
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
+
+def _detect_local_gpu_profile():
+    profile = os.environ.get("AUTORESEARCH_PROFILE", "auto").strip().lower()
+    if profile in {"local", "local-gpu", "windows"}:
+        return True
+    if profile in {"baseline", "h100"}:
+        return False
+    if platform.system() != "Windows" or not torch.cuda.is_available():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(0)
+    except Exception:
+        return True
+    return props.total_memory <= 24 * 1024**3
+
+
+LOCAL_GPU_PROFILE = _detect_local_gpu_profile()
+DEFAULT_MAX_SEQ_LEN = 512 if LOCAL_GPU_PROFILE else 2048
+DEFAULT_EVAL_TOKENS = 4 * 524288 if LOCAL_GPU_PROFILE else 40 * 524288
+DEFAULT_VOCAB_SIZE = 4096 if LOCAL_GPU_PROFILE else 8192
+
+
+def _detect_dataset_name():
+    dataset = os.environ.get("AUTORESEARCH_DATASET", "auto").strip().lower()
+    if dataset == "auto":
+        return "tinystories" if LOCAL_GPU_PROFILE else "climbmix"
+    aliases = {
+        "climbmix": "climbmix",
+        "climbmix-400b": "climbmix",
+        "tinystories": "tinystories",
+        "tinystories-gpt4-clean": "tinystories",
+    }
+    if dataset not in aliases:
+        raise ValueError(f"Unsupported AUTORESEARCH_DATASET={dataset!r}")
+    return aliases[dataset]
+
+
+MAX_SEQ_LEN = _env_int("AUTORESEARCH_MAX_SEQ_LEN", DEFAULT_MAX_SEQ_LEN)
+TIME_BUDGET = _env_int("AUTORESEARCH_TIME_BUDGET", 300)
+EVAL_TOKENS = _env_int("AUTORESEARCH_EVAL_TOKENS", DEFAULT_EVAL_TOKENS)
+DATASET_NAME = _detect_dataset_name()
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+if platform.system() == "Windows":
+    CACHE_ROOT = os.environ.get("LOCALAPPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Local"))
+else:
+    CACHE_ROOT = os.path.join(os.path.expanduser("~"), ".cache")
+
+CACHE_DIR = os.path.join(CACHE_ROOT, "autoresearch")
+DATA_DIR = os.path.join(CACHE_DIR, "data", DATASET_NAME)
+TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer", DATASET_NAME)
+VOCAB_SIZE = _env_int("AUTORESEARCH_VOCAB_SIZE", DEFAULT_VOCAB_SIZE)
+
+CLIMBMIX_BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
+CLIMBMIX_MAX_SHARD = 6542
+CLIMBMIX_VAL_SHARD = CLIMBMIX_MAX_SHARD
+CLIMBMIX_VAL_FILENAME = f"shard_{CLIMBMIX_VAL_SHARD:05d}.parquet"
+
+TINYSTORIES_BASE_URL = "https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean/resolve/main"
+TINYSTORIES_FILENAME = "tinystories_gpt4_clean.parquet"
+TINYSTORIES_VAL_ROWS = 10_000
+TINYSTORIES_TEST_ROWS = 10_000
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
@@ -61,18 +121,49 @@ def download_single_shard(index):
     if os.path.exists(filepath):
         return True
 
-    url = f"{BASE_URL}/{filename}"
+    url = f"{CLIMBMIX_BASE_URL}/{filename}"
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
             temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
+            with requests.get(url, stream=True, timeout=30) as response:
+                response.raise_for_status()
+                with open(temp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            os.replace(temp_path, filepath)
+            print(f"  Downloaded {filename}")
+            return True
+        except (requests.RequestException, IOError) as e:
+            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
+            for path in [filepath + ".tmp", filepath]:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+    return False
+
+
+def download_file(filename, url):
+    filepath = os.path.join(DATA_DIR, filename)
+    if os.path.exists(filepath):
+        return True
+
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            temp_path = filepath + ".tmp"
+            with requests.get(url, stream=True, timeout=30) as response:
+                response.raise_for_status()
+                with open(temp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            os.replace(temp_path, filepath)
             print(f"  Downloaded {filename}")
             return True
         except (requests.RequestException, IOError) as e:
@@ -89,28 +180,40 @@ def download_single_shard(index):
 
 
 def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+    """Download the selected dataset."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+    if DATASET_NAME == "climbmix":
+        num_train = min(num_shards, CLIMBMIX_MAX_SHARD)
+        ids = list(range(num_train))
+        if CLIMBMIX_VAL_SHARD not in ids:
+            ids.append(CLIMBMIX_VAL_SHARD)
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+        existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
+        if existing == len(ids):
+            print(f"Data ({DATASET_NAME}): all {len(ids)} shards already downloaded at {DATA_DIR}")
+            return
+
+        needed = len(ids) - existing
+        print(f"Data ({DATASET_NAME}): downloading {needed} shards ({existing} already exist)...")
+
+        workers = max(1, min(download_workers, needed))
+        with Pool(processes=workers) as pool:
+            results = pool.map(download_single_shard, ids)
+
+        ok = sum(1 for r in results if r)
+        print(f"Data ({DATASET_NAME}): {ok}/{len(ids)} shards ready at {DATA_DIR}")
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    if DATASET_NAME == "tinystories":
+        print(f"Data ({DATASET_NAME}): downloading 1 parquet shard...")
+        ok = download_file(TINYSTORIES_FILENAME, f"{TINYSTORIES_BASE_URL}/{TINYSTORIES_FILENAME}")
+        if not ok:
+            print(f"Data ({DATASET_NAME}): failed to download {TINYSTORIES_FILENAME}")
+            sys.exit(1)
+        print(f"Data ({DATASET_NAME}): ready at {DATA_DIR}")
+        return
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    raise ValueError(f"Unsupported dataset: {DATASET_NAME}")
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
@@ -122,20 +225,76 @@ def list_parquet_files():
     return [os.path.join(DATA_DIR, f) for f in files]
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
+def _iter_climbmix_text(split):
+    parquet_paths = list_parquet_files()
+    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
+    val_path = os.path.join(DATA_DIR, CLIMBMIX_VAL_FILENAME)
+    if split == "train":
+        parquet_paths = [p for p in parquet_paths if p != val_path]
+    elif split == "val":
+        parquet_paths = [val_path]
+    else:
+        raise ValueError(f"Unsupported split for climbmix: {split}")
+
     for filepath in parquet_paths:
         pf = pq.ParquetFile(filepath)
         for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
+            rg = pf.read_row_group(rg_idx, columns=["text"])
             for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+                yield text
+
+
+def _iter_tinystories_text(split):
+    parquet_path = os.path.join(DATA_DIR, TINYSTORIES_FILENAME)
+    assert os.path.exists(parquet_path), "TinyStories parquet not found. Run prepare.py first."
+    pf = pq.ParquetFile(parquet_path)
+    total_rows = pf.metadata.num_rows
+    train_end = max(total_rows - TINYSTORIES_VAL_ROWS - TINYSTORIES_TEST_ROWS, 0)
+    val_end = min(train_end + TINYSTORIES_VAL_ROWS, total_rows)
+    if split == "train":
+        start_idx, end_idx = 0, train_end
+    elif split == "val":
+        start_idx, end_idx = train_end, val_end
+    else:
+        raise ValueError(f"Unsupported split for tinystories: {split}")
+
+    row_offset = 0
+    for rg_idx in range(pf.num_row_groups):
+        rg = pf.read_row_group(rg_idx, columns=["text"])
+        texts = rg.column("text").to_pylist()
+        rg_start = row_offset
+        rg_end = row_offset + len(texts)
+        if rg_end <= start_idx:
+            row_offset = rg_end
+            continue
+        if rg_start >= end_idx:
+            break
+        local_start = max(0, start_idx - rg_start)
+        local_end = min(len(texts), end_idx - rg_start)
+        for text in texts[local_start:local_end]:
+            yield text
+        row_offset = rg_end
+
+
+def iter_split_text(split):
+    if DATASET_NAME == "climbmix":
+        yield from _iter_climbmix_text(split)
+        return
+    if DATASET_NAME == "tinystories":
+        yield from _iter_tinystories_text(split)
+        return
+    raise ValueError(f"Unsupported dataset: {DATASET_NAME}")
+
+
+def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
+    """Yield documents from the training split."""
+    nchars = 0
+    for text in iter_split_text("train"):
+        doc = text[:doc_cap] if len(text) > doc_cap else text
+        nchars += len(doc)
+        yield doc
+        if nchars >= max_chars:
+            return
 
 
 def train_tokenizer():
@@ -149,9 +308,8 @@ def train_tokenizer():
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+    if not list_parquet_files():
+        print("Tokenizer: no parquet files found. Download data first.")
         sys.exit(1)
 
     # --- Train with rustbpe ---
@@ -252,27 +410,21 @@ def get_token_bytes(device="cpu"):
 
 
 def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-    else:
-        parquet_paths = [val_path]
+    """Infinite iterator over document batches from the configured dataset."""
     epoch = 1
     while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
+        batch = []
+        for text in iter_split_text(split):
+            batch.append(text)
+            if len(batch) == tokenizer_batch_size:
+                yield batch, epoch
+                batch = []
+        if batch:
+            yield batch, epoch
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device=None):
     """
     BOS-aligned dataloader with best-fit packing.
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
@@ -280,6 +432,10 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     100% utilization (no padding).
     """
     assert split in ["train", "val"]
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
     row_capacity = T + 1
     batches = _document_batches(split)
     bos_token = tokenizer.get_bos_token_id()
@@ -294,12 +450,15 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    batch_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    inputs = batch_buffer[:B * T].view(B, T)
+    targets = batch_buffer[B * T:].view(B, T)
+    if device.type == "cuda":
+        cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
+        cpu_inputs = cpu_buffer[:B * T].view(B, T)
+        cpu_targets = cpu_buffer[B * T:].view(B, T)
+    else:
+        cpu_buffer = None
 
     while True:
         for row_idx in range(B):
@@ -330,9 +489,13 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        if cpu_buffer is None:
+            inputs.copy_(row_buffer[:, :-1])
+            targets.copy_(row_buffer[:, 1:])
+        else:
+            cpu_inputs.copy_(row_buffer[:, :-1])
+            cpu_targets.copy_(row_buffer[:, 1:])
+            batch_buffer.copy_(cpu_buffer, non_blocking=True)
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
@@ -348,8 +511,9 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    device = next(model.parameters()).device
+    token_bytes = get_token_bytes(device=device)
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val", device=device)
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
@@ -368,14 +532,21 @@ def evaluate_bpb(model, tokenizer, batch_size):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
+    parser.add_argument("--num-shards", type=int, default=10, help="Number of climbmix training shards to download (-1 = all). Ignored for TinyStories.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    num_shards = CLIMBMIX_MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
+    print(f"Dataset: {DATASET_NAME}")
+    if LOCAL_GPU_PROFILE:
+        print("Runtime profile: local-gpu")
+        print(f"  MAX_SEQ_LEN={MAX_SEQ_LEN}, EVAL_TOKENS={EVAL_TOKENS}, VOCAB_SIZE={VOCAB_SIZE}")
+    else:
+        print("Runtime profile: baseline")
     print()
 
     # Step 1: Download data

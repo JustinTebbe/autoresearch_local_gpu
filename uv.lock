@@ -46,7 +46,6 @@ name = "autoresearch"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "kernels" },
     { name = "matplotlib" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -59,9 +58,14 @@ dependencies = [
     { name = "torch" },
 ]
 
+[package.optional-dependencies]
+flash-attn = [
+    { name = "kernels" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "kernels", specifier = ">=0.11.7" },
+    { name = "kernels", marker = "extra == 'flash-attn'", specifier = ">=0.11.7" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "pandas", specifier = ">=2.3.3" },
@@ -71,6 +75,7 @@ requires-dist = [
     { name = "tiktoken", specifier = ">=0.11.0" },
     { name = "torch", specifier = "==2.9.1", index = "https://download.pytorch.org/whl/cu128" },
 ]
+provides-extras = ["flash-attn"]
 
 [[package]]
 name = "certifi"

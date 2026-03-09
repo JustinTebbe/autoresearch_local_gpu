@@ -18,7 +18,7 @@ By design, training runs for a **fixed 5-minute time budget** (wall clock, exclu
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** A single NVIDIA GPU, Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 
@@ -28,12 +28,40 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # 2. Install dependencies
 uv sync
 
+# Optional: Linux/H100 users can install the flash-attention kernel package too
+uv sync --extra flash-attn
+
 # 3. Download data and train tokenizer (one-time, ~2 min)
 uv run prepare.py
 
 # 4. Manually run a single training experiment (~5 min)
 uv run train.py
 ```
+
+On Windows and other smaller local GPUs, the code now defaults to a `local-gpu` runtime profile. That profile applies the README recommendations automatically:
+
+- default `AUTORESEARCH_DATASET` to `tinystories`
+- lower `MAX_SEQ_LEN`, `EVAL_TOKENS`, and `VOCAB_SIZE` during `prepare.py`
+- lower `DEPTH` and `TOTAL_BATCH_SIZE` during `train.py`
+- switch `WINDOW_PATTERN` to `L`
+- prefer PyTorch SDPA over external flash-attention kernels
+
+You can override any of these explicitly with environment variables:
+
+```powershell
+$env:AUTORESEARCH_PROFILE="local-gpu"
+$env:AUTORESEARCH_DATASET="tinystories"
+$env:AUTORESEARCH_MAX_SEQ_LEN="512"
+$env:AUTORESEARCH_EVAL_TOKENS="2097152"
+$env:AUTORESEARCH_VOCAB_SIZE="4096"
+uv run prepare.py
+uv run train.py
+```
+
+Available dataset modes:
+
+- `AUTORESEARCH_DATASET=climbmix` keeps the original `climbmix-400b-shuffle` shards
+- `AUTORESEARCH_DATASET=tinystories` downloads `karpathy/tinystories-gpt4-clean` and uses its train/validation row split
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 

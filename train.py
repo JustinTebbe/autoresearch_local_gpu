@@ -9,6 +9,8 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
+import math
+import platform
 import time
 from dataclasses import dataclass, asdict
 
@@ -16,11 +18,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+try:
+    from kernels import get_kernel
+except Exception:
+    get_kernel = None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -57,6 +58,70 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+_attn_mask_cache = {}
+
+
+def _get_local_causal_mask(seq_len, window_size, device):
+    if window_size is None:
+        return None
+    left_window = window_size[0]
+    if left_window < 0 or left_window >= seq_len:
+        return None
+    key = (seq_len, left_window, device.type, device.index)
+    mask = _attn_mask_cache.get(key)
+    if mask is None:
+        q_pos = torch.arange(seq_len, device=device).view(seq_len, 1)
+        kv_pos = torch.arange(seq_len, device=device).view(1, seq_len)
+        mask = (kv_pos <= q_pos) & ((q_pos - kv_pos) < left_window)
+        _attn_mask_cache[key] = mask
+    return mask
+
+
+def _sdpa_attention(q, k, v, window_size):
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    attn_mask = _get_local_causal_mask(q.size(-2), window_size, q.device)
+    y = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        is_causal=attn_mask is None,
+    )
+    return y.transpose(1, 2).contiguous()
+
+
+def _resolve_attention_backend(device, prefer_local_profile):
+    requested = os.environ.get("AUTORESEARCH_ATTN_BACKEND", "auto").strip().lower()
+    if requested not in {"auto", "flash", "sdpa"}:
+        raise ValueError(f"Unsupported AUTORESEARCH_ATTN_BACKEND={requested!r}")
+    if requested == "sdpa":
+        return "sdpa", _sdpa_attention
+    if device.type != "cuda":
+        return "sdpa", _sdpa_attention
+    if prefer_local_profile and requested == "auto":
+        return "sdpa", _sdpa_attention
+    if get_kernel is None:
+        if requested == "flash":
+            raise RuntimeError("Flash attention backend requested, but the optional 'kernels' package is not installed.")
+        return "sdpa", _sdpa_attention
+    cap = torch.cuda.get_device_capability(device)
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    try:
+        flash_attn = get_kernel(repo).flash_attn_interface
+    except Exception:
+        if requested == "flash":
+            raise
+        return "sdpa", _sdpa_attention
+
+    def _flash_attention(q, k, v, window_size):
+        return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+
+    return f"flash:{repo}", _flash_attention
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -89,7 +154,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = ATTENTION_IMPL(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -301,8 +366,7 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
+def adamw_step_impl(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
@@ -312,9 +376,8 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+def muon_step_impl(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
+                   momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
@@ -350,6 +413,26 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+OPTIMIZER_BACKEND_NAME = "eager"
+adamw_step_fused = adamw_step_impl
+muon_step_fused = muon_step_impl
+
+
+def _configure_optimizer_backend(use_compile):
+    global OPTIMIZER_BACKEND_NAME, adamw_step_fused, muon_step_fused
+    adamw_step_fused = adamw_step_impl
+    muon_step_fused = muon_step_impl
+    OPTIMIZER_BACKEND_NAME = "eager"
+    if not use_compile:
+        return
+    try:
+        adamw_step_fused = torch.compile(adamw_step_impl, dynamic=False, fullgraph=True)
+        muon_step_fused = torch.compile(muon_step_impl, dynamic=False, fullgraph=True)
+        OPTIMIZER_BACKEND_NAME = "compiled"
+    except Exception as exc:
+        print(f"Optimizer compile unavailable, continuing in eager mode: {exc}")
 
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -455,15 +538,51 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
+if not torch.cuda.is_available():
+    raise RuntimeError("This project currently requires a CUDA-capable NVIDIA GPU.")
+
+torch.cuda.manual_seed(42)
 device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+gpu_props = torch.cuda.get_device_properties(device)
+gpu_name = gpu_props.name
+gpu_mem_gb = gpu_props.total_memory / 1024**3
+runtime_profile = os.environ.get("AUTORESEARCH_PROFILE", "auto").strip().lower()
+if runtime_profile == "auto":
+    is_local_gpu_profile = platform.system() == "Windows" or gpu_mem_gb <= 24
+else:
+    is_local_gpu_profile = runtime_profile in {"local", "local-gpu", "windows"}
+
+if is_local_gpu_profile:
+    ASPECT_RATIO = 48
+    WINDOW_PATTERN = "L"
+    DEPTH = 4
+    if MAX_SEQ_LEN >= 2048:
+        DEVICE_BATCH_SIZE = 4 if gpu_mem_gb <= 16 else 8
+    elif MAX_SEQ_LEN >= 1024:
+        DEVICE_BATCH_SIZE = 8 if gpu_mem_gb <= 16 else 16
+    elif MAX_SEQ_LEN >= 512:
+        DEVICE_BATCH_SIZE = 16 if gpu_mem_gb <= 16 else 32
+    else:
+        DEVICE_BATCH_SIZE = 32 if gpu_mem_gb <= 16 else 64
+    TOTAL_BATCH_SIZE = 2**14
+
+tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+if TOTAL_BATCH_SIZE < tokens_per_fwdbwd or TOTAL_BATCH_SIZE % tokens_per_fwdbwd != 0:
+    TOTAL_BATCH_SIZE = 1 << math.ceil(math.log2(tokens_per_fwdbwd))
+
+amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
+ATTENTION_BACKEND_NAME, ATTENTION_IMPL = _resolve_attention_backend(device, is_local_gpu_profile)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
+print(f"GPU: {gpu_name} ({gpu_mem_gb:.1f} GiB)")
+print(f"Runtime profile: {'local-gpu' if is_local_gpu_profile else 'baseline'}")
+print(f"Attention backend: {ATTENTION_BACKEND_NAME}")
+print(f"Autocast dtype: {amp_dtype}")
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
@@ -491,7 +610,6 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
@@ -504,13 +622,29 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+compile_mode = os.environ.get("AUTORESEARCH_COMPILE", "auto").strip().lower()
+if compile_mode == "auto":
+    use_compile = not is_local_gpu_profile
+else:
+    use_compile = compile_mode not in {"0", "false", "off"}
+optimizer_compile_mode = os.environ.get("AUTORESEARCH_COMPILE_OPTIMIZER", "auto").strip().lower()
+if optimizer_compile_mode == "auto":
+    use_compiled_optimizer = use_compile
+else:
+    use_compiled_optimizer = optimizer_compile_mode not in {"0", "false", "off"}
+_configure_optimizer_backend(use_compiled_optimizer)
+if use_compile:
+    try:
+        model = torch.compile(model, dynamic=False)
+    except Exception as exc:
+        print(f"torch.compile unavailable, continuing in eager mode: {exc}")
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train", device=device)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Optimizer backend: {OPTIMIZER_BACKEND_NAME}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
